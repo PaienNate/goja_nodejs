@@ -30,12 +30,12 @@ func (r *RequireModule) resolve(modpath string) (module *js.Object, err error) {
 
 	p := r.resolvePath(start, modpath)
 	if isFileOrDirectoryPath(modpath) {
-		if module = r.modules[p]; module != nil {
-			return
+		if module, ok := r.modules.Load(p); ok {
+			return module, nil
 		}
 		module, err = r.loadAsFileOrDirectory(p)
 		if err == nil && module != nil {
-			r.modules[p] = module
+			r.modules.Store(p, module)
 		}
 	} else {
 		module, err = r.loadNative(modpath)
@@ -48,12 +48,12 @@ func (r *RequireModule) resolve(modpath string) (module *js.Object, err error) {
 				return
 			}
 		}
-		if module = r.nodeModules[p]; module != nil {
-			return
+		if module, ok := r.nodeModules.Load(p); ok {
+			return module, nil
 		}
 		module, err = r.loadNodeModules(modpath, start)
 		if err == nil && module != nil {
-			r.nodeModules[p] = module
+			r.nodeModules.Store(p, module)
 		}
 	}
 
@@ -64,21 +64,21 @@ func (r *RequireModule) resolve(modpath string) (module *js.Object, err error) {
 }
 
 func (r *RequireModule) loadNative(path string) (*js.Object, error) {
-	module := r.modules[path]
-	if module != nil {
+	if module, ok := r.modules.Load(path); ok {
 		return module, nil
 	}
 
 	var ldr ModuleLoader
-	if ldr = r.r.native[path]; ldr == nil {
-		ldr = native[path]
+	ldr, _ = r.r.native.Load(path)
+	if ldr == nil {
+		ldr, _ = native.Load(path)
 	}
 
 	var isBuiltIn, withPrefix bool
 	if ldr == nil {
-		ldr = builtin[path]
+		ldr, _ = builtin.Load(path)
 		if ldr == nil && strings.HasPrefix(path, NodePrefix) {
-			ldr = builtin[path[len(NodePrefix):]]
+			ldr, _ = builtin.Load(path[len(NodePrefix):])
 			if ldr == nil {
 				return nil, NoSuchBuiltInModuleError
 			}
@@ -88,14 +88,14 @@ func (r *RequireModule) loadNative(path string) (*js.Object, error) {
 	}
 
 	if ldr != nil {
-		module = r.createModuleObject()
-		r.modules[path] = module
+		module := r.createModuleObject()
+		r.modules.Store(path, module)
 		if isBuiltIn {
 			if withPrefix {
-				r.modules[path[len(NodePrefix):]] = module
+				r.modules.Store(path[len(NodePrefix):], module)
 			} else {
 				if !strings.HasPrefix(path, NodePrefix) {
-					r.modules[NodePrefix+path] = module
+					r.modules.Store(NodePrefix+path, module)
 				}
 			}
 		}
@@ -209,21 +209,21 @@ func (r *RequireModule) createModuleObject() *js.Object {
 }
 
 func (r *RequireModule) loadModule(path string) (*js.Object, error) {
-	module := r.modules[path]
-	if module == nil {
-		module = r.createModuleObject()
-		r.modules[path] = module
-		err := r.loadModuleFile(path, module)
-		if err != nil {
-			module = nil
-			delete(r.modules, path)
-			if errors.Is(err, ModuleFileDoesNotExistError) {
-				err = nil
-			}
-		}
-		return module, err
+	if module, ok := r.modules.Load(path); ok {
+		return module, nil
 	}
-	return module, nil
+	
+	module := r.createModuleObject()
+	r.modules.Store(path, module)
+	err := r.loadModuleFile(path, module)
+	if err != nil {
+		module = nil
+		r.modules.Delete(path)
+		if errors.Is(err, ModuleFileDoesNotExistError) {
+			err = nil
+		}
+	}
+	return module, err
 }
 
 func (r *RequireModule) loadModuleFile(path string, jsModule *js.Object) error {

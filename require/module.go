@@ -37,13 +37,13 @@ var (
 	ModuleFileDoesNotExistError = errors.New("module file does not exist")
 )
 
-var native, builtin map[string]ModuleLoader
+var native, builtin SafeMap[string, ModuleLoader]
 
 // Registry contains a cache of compiled modules which can be used by multiple Runtimes
 type Registry struct {
 	sync.Mutex
-	native   map[string]ModuleLoader
-	compiled map[string]*js.Program
+	native   SafeMap[string, ModuleLoader]
+	compiled SafeMap[string, *js.Program]
 
 	srcLoader     SourceLoader
 	pathResolver  PathResolver
@@ -53,8 +53,8 @@ type Registry struct {
 type RequireModule struct {
 	r           *Registry
 	runtime     *js.Runtime
-	modules     map[string]*js.Object
-	nodeModules map[string]*js.Object
+	modules     SafeMap[string, *js.Object]
+	nodeModules SafeMap[string, *js.Object]
 }
 
 func NewRegistry(opts ...Option) *Registry {
@@ -107,10 +107,9 @@ func WithGlobalFolders(globalFolders ...string) Option {
 // Enable adds the require() function to the specified runtime.
 func (r *Registry) Enable(runtime *js.Runtime) *RequireModule {
 	rrt := &RequireModule{
-		r:           r,
-		runtime:     runtime,
-		modules:     make(map[string]*js.Object),
-		nodeModules: make(map[string]*js.Object),
+		r:       r,
+		runtime: runtime,
+		// modules and nodeModules use zero values (no initialization needed)
 	}
 
 	runtime.Set("require", rrt.require)
@@ -121,11 +120,8 @@ func (r *Registry) RegisterNativeModule(name string, loader ModuleLoader) {
 	r.Lock()
 	defer r.Unlock()
 
-	if r.native == nil {
-		r.native = make(map[string]ModuleLoader)
-	}
 	name = filepathClean(name)
-	r.native[name] = loader
+	r.native.Store(name, loader)
 }
 
 // DefaultSourceLoader is used if none was set (see WithLoader()). It simply loads files from the host's filesystem.
@@ -182,7 +178,7 @@ func (r *Registry) getCompiledSource(p string) (*js.Program, error) {
 	r.Lock()
 	defer r.Unlock()
 
-	prg := r.compiled[p]
+	prg, _ := r.compiled.Load(p)
 	if prg == nil {
 		buf, err := r.getSource(p)
 		if err != nil {
@@ -201,10 +197,7 @@ func (r *Registry) getCompiledSource(p string) (*js.Program, error) {
 		}
 		prg, err = js.CompileAST(parsed, false)
 		if err == nil {
-			if r.compiled == nil {
-				r.compiled = make(map[string]*js.Program)
-			}
-			r.compiled[p] = prg
+			r.compiled.Store(p, prg)
 		}
 		return prg, err
 	}
@@ -256,11 +249,8 @@ func Require(runtime *js.Runtime, name string) js.Value {
 // It should be called from a package init() function as it may not be used concurrently with require() calls.
 // For registry-specific bindings see Registry.RegisterNativeModule.
 func RegisterNativeModule(name string, loader ModuleLoader) {
-	if native == nil {
-		native = make(map[string]ModuleLoader)
-	}
 	name = filepathClean(name)
-	native[name] = loader
+	native.Store(name, loader)
 }
 
 // RegisterCoreModule registers a nodejs core module. If the name does not start with "node:", the module
@@ -268,9 +258,6 @@ func RegisterNativeModule(name string, loader ModuleLoader) {
 // the name should not include the "node:" prefix, but for prefix-only core modules (such as "node:test")
 // it should include the prefix.
 func RegisterCoreModule(name string, loader ModuleLoader) {
-	if builtin == nil {
-		builtin = make(map[string]ModuleLoader)
-	}
 	name = filepathClean(name)
-	builtin[name] = loader
+	builtin.Store(name, loader)
 }
