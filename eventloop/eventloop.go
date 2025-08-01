@@ -10,9 +10,16 @@
 //
 // Usage:
 //
+//	// Use with custom logger
 //	loop := NewEventLoop(
 //	  WithLogger(myLogger),
 //	  WithDebugLog(false), // Keep false in production for best performance
+//	)
+//
+//	// Use with kratos logger (backward compatible)
+//	import "github.com/go-kratos/kratos/v2/log"
+//	loop := NewEventLoop(
+//	  WithLoggerHelper(log.NewHelper(log.With(log.GetLogger(), "component", "EventLoop"))),
 //	)
 //
 // Fork from goga-nodejs
@@ -29,9 +36,30 @@ import (
 	"github.com/dop251/goja"
 	"github.com/dop251/goja_nodejs/console"
 	"github.com/dop251/goja_nodejs/require"
-	"github.com/go-kratos/kratos/v2/log"
 	"github.com/panjf2000/ants/v2"
 )
+
+// Logger is a simple logging interface that can be implemented by any logging library.
+// This allows users to provide their own logging implementation instead of being tied to kratos logger.
+type Logger interface {
+	// Debug logs debug messages. Implementations should handle nil or empty messages gracefully.
+	Debug(args ...interface{})
+	// Debugf logs formatted debug messages. Implementations should handle nil format strings gracefully.
+	Debugf(format string, args ...interface{})
+	// Info logs informational messages. Implementations should handle nil or empty messages gracefully.
+	Info(args ...interface{})
+	// Infof logs formatted informational messages. Implementations should handle nil format strings gracefully.
+	Infof(format string, args ...interface{})
+	// Warn logs warning messages. Implementations should handle nil or empty messages gracefully.
+	Warn(args ...interface{})
+	// Warnf logs formatted warning messages. Implementations should handle nil format strings gracefully.
+	Warnf(format string, args ...interface{})
+	// Error logs error messages. Implementations should handle nil or empty messages gracefully.
+	Error(args ...interface{})
+	// Errorf logs formatted error messages. Implementations should handle nil format strings gracefully.
+	Errorf(format string, args ...interface{})
+}
+
 
 type job struct {
 	cancel func() bool
@@ -84,8 +112,8 @@ type EventLoop struct {
 	// Enhanced panic handling and lifecycle management
 	ctx        context.Context
 	cancel     context.CancelFunc
-	panicCount int64       // atomic counter for panic statistics
-	helper     *log.Helper // Kratos log helper for convenient logging
+	panicCount int64  // atomic counter for panic statistics
+	logger     Logger // Logger interface for flexible logging
 
 	// Performance optimization flags
 	enableDebugLog bool // Control debug level logging for performance
@@ -105,8 +133,8 @@ func NewEventLoop(opts ...Option) *EventLoop {
 		poolSize:       100, // default pool size
 		ctx:            ctx,
 		cancel:         cancel,
-		helper:         log.NewHelper(log.With(log.GetLogger(), "component", "EventLoop")), // default Kratos logger
-		enableDebugLog: false,                                                              // Default to false for better performance - reduces log overhead
+		logger:         &defaultLogger{}, // default simple logger
+		enableDebugLog: false,            // Default to false for better performance - reduces log overhead
 	}
 	loop.stopCond = sync.NewCond(&loop.stopLock)
 
@@ -120,10 +148,12 @@ func NewEventLoop(opts ...Option) *EventLoop {
 		ants.WithPanicHandler(func(p interface{}) {
 			// Optimized panic handling - reduced logging overhead for better performance
 			atomic.AddInt64(&loop.panicCount, 1)
-			loop.helper.Errorf("Panic in ants pool: %v", p)
-			// Stack trace only in debug mode to reduce performance impact
-			if loop.enableDebugLog {
-				loop.helper.Debugf("Stack trace for ants pool panic:\n%s", debug.Stack())
+			if loop.logger != nil {
+				loop.logger.Errorf("Panic in ants pool: %v", p)
+				// Stack trace only in debug mode to reduce performance impact
+				if loop.enableDebugLog {
+					loop.logger.Debugf("Stack trace for ants pool panic:\n%s", debug.Stack())
+				}
 			}
 		}),
 		ants.WithDisablePurge(true), // Disable background cleanup goroutines for performance
@@ -131,7 +161,9 @@ func NewEventLoop(opts ...Option) *EventLoop {
 	if err != nil {
 		// Fallback: if pool creation fails, set pool to nil
 		// The code will handle this gracefully by falling back to direct goroutines
-		loop.helper.Errorf("Failed to create ants pool: %v, falling back to direct goroutines", err)
+		if loop.logger != nil {
+			loop.logger.Errorf("Failed to create ants pool: %v, falling back to direct goroutines", err)
+		}
 		loop.pool = nil
 	} else {
 		loop.pool = pool
@@ -181,10 +213,10 @@ func WithPoolSize(size int) Option {
 	}
 }
 
-// WithLoggerHelper sets a custom Kratos logger for the event loop
-func WithLoggerHelper(logger *log.Helper) Option {
+// WithLogger sets a custom logger for the event loop
+func WithLogger(logger Logger) Option {
 	return func(loop *EventLoop) {
-		loop.helper = logger
+		loop.logger = logger
 	}
 }
 
@@ -198,6 +230,42 @@ func WithDebugLog(enable bool) Option {
 	}
 }
 
+// defaultLogger is a simple default logger implementation that uses fmt.Println
+// It provides basic logging functionality when no custom logger is provided
+type defaultLogger struct{}
+
+func (d *defaultLogger) Debug(args ...interface{}) {
+	fmt.Println(args...)
+}
+
+func (d *defaultLogger) Debugf(format string, args ...interface{}) {
+	fmt.Printf(format+"\n", args...)
+}
+
+func (d *defaultLogger) Info(args ...interface{}) {
+	fmt.Println(args...)
+}
+
+func (d *defaultLogger) Infof(format string, args ...interface{}) {
+	fmt.Printf(format+"\n", args...)
+}
+
+func (d *defaultLogger) Warn(args ...interface{}) {
+	fmt.Println(args...)
+}
+
+func (d *defaultLogger) Warnf(format string, args ...interface{}) {
+	fmt.Printf("WARN: "+format+"\n", args...)
+}
+
+func (d *defaultLogger) Error(args ...interface{}) {
+	fmt.Println(args...)
+}
+
+func (d *defaultLogger) Errorf(format string, args ...interface{}) {
+	fmt.Printf("ERROR: "+format+"\n", args...)
+}
+
 // GetPanicCount returns the total number of panics that have occurred
 func (loop *EventLoop) GetPanicCount() int64 {
 	return atomic.LoadInt64(&loop.panicCount)
@@ -209,9 +277,9 @@ func (loop *EventLoop) reinitializeContext() {
 	loop.ctx, loop.cancel = context.WithCancel(context.Background())
 	loop.terminated = false
 	// Only log context reinitialization in debug mode to reduce performance impact
-	if loop.helper != nil && loop.enableDebugLog {
-		loop.helper.Debugf("Event loop context reinitialized for restart")
-	}
+		if loop.logger != nil && loop.enableDebugLog {
+			loop.logger.Debugf("Event loop context reinitialized for restart")
+		}
 }
 
 // safeExecute wraps function execution with panic recovery
@@ -223,11 +291,11 @@ func (loop *EventLoop) safeExecute(name string, fn func()) {
 		if r := recover(); r != nil {
 			atomic.AddInt64(&loop.panicCount, 1)
 			// Only include stack trace for critical errors to reduce log size
-			if loop.helper != nil {
-				loop.helper.Errorf("Panic in %s: %v", name, r)
+			if loop.logger != nil {
+				loop.logger.Errorf("Panic in %s: %v", name, r)
 				// Stack trace only in debug mode
 				if loop.enableDebugLog {
-					loop.helper.Debugf("Stack trace for panic in %s:\n%s", name, debug.Stack())
+					loop.logger.Debugf("Stack trace for panic in %s:\n%s", name, debug.Stack())
 				}
 			}
 		}
@@ -245,7 +313,9 @@ func (loop *EventLoop) schedule(call goja.FunctionCall, repeating bool) goja.Val
 		f := func() {
 			_, err := fn(nil, args...)
 			if err != nil {
-				loop.helper.Errorf("Error in scheduled function: %v", err)
+				if loop.logger != nil {
+					loop.logger.Errorf("Error in scheduled function: %v", err)
+				}
 				return
 			}
 		}
@@ -287,7 +357,9 @@ func (loop *EventLoop) setImmediate(call goja.FunctionCall) goja.Value {
 		f := func() {
 			_, err := fn(nil, args...)
 			if err != nil {
-				loop.helper.Error(fmt.Sprintf("JS immediate callback error: %v", err))
+				if loop.logger != nil {
+					loop.logger.Errorf("JS immediate callback error: %v", err)
+				}
 				return
 			}
 		}
@@ -369,8 +441,8 @@ func (loop *EventLoop) setRunning() {
 	atomic.StoreInt32(&loop.canRun, 1)
 	loop.running = true
 	// Use debug level for routine operations to reduce log noise
-	if loop.helper != nil && loop.enableDebugLog {
-		loop.helper.Debugf("Event loop started")
+	if loop.logger != nil && loop.enableDebugLog {
+		loop.logger.Debugf("Event loop started")
 	}
 }
 
@@ -438,8 +510,8 @@ func (loop *EventLoop) StopNoWait() {
 // After being terminated the loop can be restarted again by using Start() or Run().
 // This method must not be called concurrently with Stop*(), Start(), or Run().
 func (loop *EventLoop) Terminate() {
-	if loop.helper != nil && loop.enableDebugLog {
-		loop.helper.Debugf("Terminating event loop...")
+	if loop.logger != nil && loop.enableDebugLog {
+		loop.logger.Debugf("Terminating event loop...")
 	}
 
 	// Cancel context to signal all goroutines to stop
@@ -482,13 +554,13 @@ func (loop *EventLoop) Terminate() {
 
 	// Only log termination statistics if there were panics or in debug mode
 	panicCount := loop.GetPanicCount()
-	if loop.helper != nil {
-		if panicCount > 0 {
-			loop.helper.Warnf("Event loop terminated with %d panics handled", panicCount)
-		} else if loop.enableDebugLog {
-			loop.helper.Debugf("Event loop terminated successfully")
+	if loop.logger != nil {
+			if panicCount > 0 {
+				loop.logger.Warnf("Event loop terminated with %d panics handled", panicCount)
+			} else if loop.enableDebugLog {
+				loop.logger.Debugf("Event loop terminated successfully")
+			}
 		}
-	}
 }
 
 // RunOnLoop schedules to run the specified function in the context of the loop as soon as possible.
@@ -518,10 +590,10 @@ func (loop *EventLoop) run(inBackground bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			atomic.AddInt64(&loop.panicCount, 1)
-			if loop.helper != nil {
-				loop.helper.Errorf("Panic in event loop run: %v", r)
+			if loop.logger != nil {
+				loop.logger.Errorf("Panic in event loop run: %v", r)
 				if loop.enableDebugLog {
-					loop.helper.Debugf("Stack trace for event loop panic:\n%s", debug.Stack())
+					loop.logger.Debugf("Stack trace for event loop panic:\n%s", debug.Stack())
 				}
 			}
 		}
@@ -547,8 +619,8 @@ LOOP:
 			}
 		case <-loop.ctx.Done():
 			// Context cancelled, graceful shutdown
-			if loop.helper != nil && loop.enableDebugLog {
-				loop.helper.Debugf("Event loop context cancelled, shutting down gracefully")
+			if loop.logger != nil && loop.enableDebugLog {
+				loop.logger.Debugf("Event loop context cancelled, shutting down gracefully")
 			}
 			break LOOP
 		}
