@@ -60,7 +60,6 @@ type Logger interface {
 	Errorf(format string, args ...interface{})
 }
 
-
 type job struct {
 	cancel func() bool
 	fn     func()
@@ -277,9 +276,9 @@ func (loop *EventLoop) reinitializeContext() {
 	loop.ctx, loop.cancel = context.WithCancel(context.Background())
 	loop.terminated = false
 	// Only log context reinitialization in debug mode to reduce performance impact
-		if loop.logger != nil && loop.enableDebugLog {
-			loop.logger.Debugf("Event loop context reinitialized for restart")
-		}
+	if loop.logger != nil && loop.enableDebugLog {
+		loop.logger.Debugf("Event loop context reinitialized for restart")
+	}
 }
 
 // safeExecute wraps function execution with panic recovery
@@ -536,10 +535,18 @@ func (loop *EventLoop) Terminate() {
 		}
 	}
 
-	for len(loop.jobs) > 0 {
-		loop.safeExecute("terminate-cleanup", func() {
-			(<-loop.jobChan)()
-		})
+	// for len(loop.jobs) > 0 {
+	// 	loop.safeExecute("terminate-cleanup", func() {
+	// 		(<-loop.jobChan)()
+	// 	})
+	// }
+	// 使用非阻塞select避免死锁
+	select {
+	case jober := <-loop.jobChan:
+		// 直接执行job，避免safeExecute的阻塞
+		jober()
+	default:
+		// 通道为空，跳出循环
 	}
 
 	// Wait for any background goroutines to complete
@@ -555,12 +562,12 @@ func (loop *EventLoop) Terminate() {
 	// Only log termination statistics if there were panics or in debug mode
 	panicCount := loop.GetPanicCount()
 	if loop.logger != nil {
-			if panicCount > 0 {
-				loop.logger.Warnf("Event loop terminated with %d panics handled", panicCount)
-			} else if loop.enableDebugLog {
-				loop.logger.Debugf("Event loop terminated successfully")
-			}
+		if panicCount > 0 {
+			loop.logger.Warnf("Event loop terminated with %d panics handled", panicCount)
+		} else if loop.enableDebugLog {
+			loop.logger.Debugf("Event loop terminated successfully")
 		}
+	}
 }
 
 // RunOnLoop schedules to run the specified function in the context of the loop as soon as possible.
