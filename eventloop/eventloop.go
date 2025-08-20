@@ -27,6 +27,7 @@ package eventloop
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime/debug"
 	"sync"
@@ -36,7 +37,6 @@ import (
 	"github.com/dop251/goja"
 	"github.com/dop251/goja_nodejs/console"
 	"github.com/dop251/goja_nodejs/require"
-	"github.com/panjf2000/ants/v2"
 )
 
 // Logger is a simple logging interface that can be implemented by any logging library.
@@ -103,10 +103,7 @@ type EventLoop struct {
 
 	enableConsole bool
 	registry      *require.Registry
-
-	// ants goroutine pool
-	pool     *ants.Pool
-	poolSize int
+	jsRequire     *require.RequireModule
 
 	// Enhanced panic handling and lifecycle management
 	ctx        context.Context
@@ -129,7 +126,6 @@ func NewEventLoop(opts ...Option) *EventLoop {
 		jobChan:        make(chan func()),
 		wakeupChan:     make(chan struct{}, 1),
 		enableConsole:  true,
-		poolSize:       100, // default pool size
 		ctx:            ctx,
 		cancel:         cancel,
 		logger:         &defaultLogger{}, // default simple logger
@@ -142,45 +138,19 @@ func NewEventLoop(opts ...Option) *EventLoop {
 		opt(loop)
 	}
 
-	// Initialize ants pool with optimized panic handler for better performance
-	pool, err := ants.NewPool(loop.poolSize,
-		ants.WithPanicHandler(func(p interface{}) {
-			// Optimized panic handling - reduced logging overhead for better performance
-			atomic.AddInt64(&loop.panicCount, 1)
-			if loop.logger != nil {
-				loop.logger.Errorf("Panic in ants pool: %v", p)
-				// Stack trace only in debug mode to reduce performance impact
-				if loop.enableDebugLog {
-					loop.logger.Debugf("Stack trace for ants pool panic:\n%s", debug.Stack())
-				}
-			}
-		}),
-		ants.WithDisablePurge(true), // Disable background cleanup goroutines for performance
-	)
-	if err != nil {
-		// Fallback: if pool creation fails, set pool to nil
-		// The code will handle this gracefully by falling back to direct goroutines
-		if loop.logger != nil {
-			loop.logger.Errorf("Failed to create ants pool: %v, falling back to direct goroutines", err)
-		}
-		loop.pool = nil
-	} else {
-		loop.pool = pool
-	}
-
 	if loop.registry == nil {
 		loop.registry = new(require.Registry)
 	}
-	loop.registry.Enable(vm)
+	loop.jsRequire = loop.registry.Enable(vm)
 	if loop.enableConsole {
 		console.Enable(vm)
 	}
-	vm.Set("setTimeout", loop.setTimeout)
-	vm.Set("setInterval", loop.setInterval)
-	vm.Set("setImmediate", loop.setImmediate)
-	vm.Set("clearTimeout", loop.clearTimeout)
-	vm.Set("clearInterval", loop.clearInterval)
-	vm.Set("clearImmediate", loop.clearImmediate)
+	_ = vm.Set("setTimeout", loop.setTimeout)
+	_ = vm.Set("setInterval", loop.setInterval)
+	_ = vm.Set("setImmediate", loop.setImmediate)
+	_ = vm.Set("clearTimeout", loop.clearTimeout)
+	_ = vm.Set("clearInterval", loop.clearInterval)
+	_ = vm.Set("clearImmediate", loop.clearImmediate)
 
 	return loop
 }
@@ -200,15 +170,6 @@ func EnableConsole(enableConsole bool) Option {
 func WithRegistry(registry *require.Registry) Option {
 	return func(loop *EventLoop) {
 		loop.registry = registry
-	}
-}
-
-// WithPoolSize sets the goroutine pool size for ants
-func WithPoolSize(size int) Option {
-	return func(loop *EventLoop) {
-		if size > 0 {
-			loop.poolSize = size
-		}
 	}
 }
 
@@ -524,6 +485,7 @@ func (loop *EventLoop) Terminate() {
 
 	loop.runAux()
 
+	// First, cancel ALL jobs before draining jobChan to prevent new jobs from being queued
 	for i := 0; i < len(loop.jobs); i++ {
 		job := loop.jobs[i]
 		if !job.cancelled {
@@ -535,28 +497,13 @@ func (loop *EventLoop) Terminate() {
 		}
 	}
 
-	// for len(loop.jobs) > 0 {
-	// 	loop.safeExecute("terminate-cleanup", func() {
-	// 		(<-loop.jobChan)()
-	// 	})
-	// }
-	// 使用非阻塞select避免死锁
+	// After all jobs are cancelled, drain jobChan with non-blocking select to prevent deadlock
 	select {
 	case jober := <-loop.jobChan:
-		// 直接执行job，避免safeExecute的阻塞
+		// Execute any pending job to prevent goroutine leak
 		jober()
 	default:
-		// 通道为空，跳出循环
-	}
-
-	// Wait for any background goroutines to complete
-	// Note: With unified goroutine management, most tasks are handled by ants pool
-	// or short-lived goroutines that don't require explicit waiting
-
-	// Clean up ants pool
-	if loop.pool != nil {
-		loop.pool.Release()
-		loop.pool = nil
+		// Channel is empty, continue
 	}
 
 	// Only log termination statistics if there were panics or in debug mode
@@ -646,21 +593,7 @@ func (loop *EventLoop) wakeup() {
 
 // submitTask submits a task to the ants pool for unified concurrency control
 func (loop *EventLoop) submitTask(task func()) {
-	executeTask := func() {
-		loop.safeExecute("task", task)
-	}
-
-	if loop.pool != nil {
-		// Use ants pool with enhanced error handling
-		err := loop.pool.Submit(executeTask)
-		if err != nil {
-			// Pool is full or closed, use direct goroutine with context cancellation support
-			go executeTask()
-		}
-	} else {
-		// Pool not available, use direct goroutine
-		go executeTask()
-	}
+	go loop.safeExecute("task", task)
 }
 
 func (loop *EventLoop) addAuxJob(fn func()) bool {
@@ -673,6 +606,14 @@ func (loop *EventLoop) addAuxJob(fn func()) bool {
 	loop.auxJobsLock.Unlock()
 	loop.wakeup()
 	return true
+}
+
+// RequireModule loads a module with eventloop require.
+func (loop *EventLoop) RequireModule(modulePath string) (goja.Value, error) {
+	if loop.jsRequire == nil {
+		return nil, errors.New("require module not initialized")
+	}
+	return loop.jsRequire.Require(modulePath)
 }
 
 func (loop *EventLoop) newTimeout(f func()) *Timer {
