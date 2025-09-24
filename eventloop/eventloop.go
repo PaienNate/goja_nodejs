@@ -608,12 +608,37 @@ func (loop *EventLoop) addAuxJob(fn func()) bool {
 	return true
 }
 
-// RequireModule loads a module with eventloop require.
+// RequireModule loads a module with eventloop require in a goroutine-safe manner.
+// This method can be called from any goroutine and will automatically schedule
+// the module loading operation within the event loop's execution context.
+// It blocks until the module is loaded or an error occurs.
 func (loop *EventLoop) RequireModule(modulePath string) (goja.Value, error) {
 	if loop.jsRequire == nil {
 		return nil, errors.New("require module not initialized")
 	}
-	return loop.jsRequire.Require(modulePath)
+	
+	// Use a channel to synchronously wait for the result
+	resultChan := make(chan struct {
+		value goja.Value
+		err   error
+	}, 1)
+	
+	// Schedule the require operation on the event loop
+	scheduled := loop.RunOnLoop(func(vm *goja.Runtime) {
+		module, err := loop.jsRequire.Require(modulePath)
+		resultChan <- struct {
+			value goja.Value
+			err   error
+		}{module, err}
+	})
+	
+	if !scheduled {
+		return nil, errors.New("event loop is terminated")
+	}
+	
+	// Wait for the result
+	result := <-resultChan
+	return result.value, result.err
 }
 
 func (loop *EventLoop) newTimeout(f func()) *Timer {
